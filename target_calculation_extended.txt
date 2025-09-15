@@ -1,0 +1,421 @@
+# ============================================================
+# Target labeling from TPSD/TPFP activity
+# ============================================================
+
+import pandas as pd
+import numpy as np
+from typing import Optional, Dict
+
+
+def _month_floor_threshold(last_tpsd_date: pd.Series) -> pd.Series:
+    """
+    Compute the resignation LOWER-BOUND threshold as:
+
+        floor_to_month_start(last_tpsd_date - 1 month)
+
+    i.e., subtract one calendar month from the anchor date and then truncate
+    to the FIRST day of that (resulting) month.
+
+    Example:
+      last_tpsd_date = 2025-06-15  ->  minus 1 month = 2025-05-15
+      floor to month start -> 2025-05-01
+
+    BigQuery SQL hint:
+      DATE_TRUNC(DATE_SUB(last_tpsd_date, INTERVAL 1 MONTH), MONTH)
+    """
+    return (last_tpsd_date - pd.DateOffset(months=1)).dt.to_period("M").dt.to_timestamp()
+
+
+def _build_tpsd_anchor(
+    rep: pd.DataFrame,
+    *,
+    balance_threshold: float,
+    obs_window: int,
+    current_date: pd.Timestamp
+) -> pd.DataFrame:
+    """
+    Build the TPSD anchor row per user and derive observation window metadata.
+
+    Steps (within users who have a known resignation date):
+      1) Restrict to resigned users: ee_resignation_date_correct IS NOT NULL.
+      2) Among TPSD rows, take the latest per user by (repaid_date DESC, due_date DESC).
+      3) Keep only anchors where that exact TPSD row has osbal_after > `balance_threshold`.
+      4) last_tpsd_date := repaid_date of that selected TPSD row.
+      5) obs_end := last_tpsd_date + `obs_window` months.
+      6) future_flag := 1 if obs_end > current_date else 0.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ['user_id', 'last_tpsd_date', 'obs_end', 'future_flag']
+
+    BigQuery SQL mapping
+    --------------------
+    - Latest TPSD row:
+        QUALIFY ROW_NUMBER() OVER (
+          PARTITION BY user_id
+          ORDER BY repaid_date DESC, due_date DESC
+        ) = 1
+    - future_flag:
+        CASE WHEN DATE_ADD(last_tpsd_date, INTERVAL obs_window MONTH) > current_date THEN 1 ELSE 0 END
+    """
+    mask_resigned = rep["ee_resignation_date_correct"].notna()
+
+    # Latest TPSD row per user
+    tpsd_latest = (
+        rep[mask_resigned]
+        .query('vendor_id == "TPSD"')
+        .sort_values(["user_id", "repaid_date", "due_date"], ascending=[True, False, False])
+        .groupby("user_id", as_index=False).head(1)[["user_id", "repaid_date", "due_date"]]
+    )
+
+    # Join back to apply osbal_after filter on the exact chosen row
+    tpsd_anchor = (
+        rep[mask_resigned]
+        .merge(tpsd_latest, how="right", on=["user_id", "repaid_date", "due_date"])
+        .query(f'vendor_id == "TPSD" & osbal_after > {balance_threshold}')
+        .drop_duplicates("user_id")
+        .rename(columns={"repaid_date": "last_tpsd_date"})
+        [["user_id", "last_tpsd_date"]]
+        .assign(
+            obs_end=lambda x: x["last_tpsd_date"] + pd.DateOffset(months=obs_window),
+        )
+    )
+    tpsd_anchor["future_flag"] = (tpsd_anchor["obs_end"] > current_date).astype(int)
+    return tpsd_anchor
+
+
+def _derive_tpfp_labels(
+    base: pd.DataFrame,
+    *,
+    balance_threshold: float,
+    current_date: pd.Timestamp
+) -> tuple[list, list]:
+    """
+    TPFP branch (users with TPFP activity inside the observation window).
+
+    Logic
+    -----
+    - Identify users who have any TPFP row with repaid_date <= obs_end
+      (and repaid_date >= last_tpsd_date since `base` is already anchored).
+    - For those users, mark TPFP loans as "non-repaid" if
+      MIN(osbal_after) over (user_id, loan_id) > `balance_threshold`.
+    - Build a user-level performance window:
+        perf_start_date := MIN(TPFP repaid_date, TPFP due_date)
+        perf_end_date   := MAX(TPFP repaid_date, TPFP due_date) + 2 months
+    - Keep rows that fall inside [perf_start_date, perf_end_date].
+    - perf_window_flag := 1 if perf_end_date <= current_date, else 0.
+    - target := 1 if there is ANY vendor not in {"TPFP","TPSD"} inside the perf window;
+                otherwise 0.
+    - target_maturity_flag := 0 only if the perf window is still open AND target==0;
+                              1 in every other case.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per user with columns:
+        ['user_id', 'target', 'last_tpsd_date', 'target_maturity_flag',
+         'perf_start_date', 'perf_end_date']
+
+    BigQuery SQL mapping
+    --------------------
+    - Non-repaid TPFP loan per user/loan:
+        MIN(osbal_after) OVER (PARTITION BY user_id, loan_id) > balance_threshold
+    - perf window dates:
+        MIN(...) and MAX(...) over TPFP rows per user
+    - Window slice:
+        repaid_date BETWEEN perf_start_date AND perf_end_date
+    """
+    tpfp_in_obs_users = (
+        base.query('repaid_date <= obs_end & vendor_id == "TPFP"')["user_id"].unique().tolist()
+    )
+    mask_tpfp = base["user_id"].isin(tpfp_in_obs_users)
+
+    # Non-repaid TPFP loans (min osbal_after > threshold)
+    tpfp_nonrepaid = (
+        base[mask_tpfp]
+        .query('vendor_id == "TPFP"')
+        .groupby(["user_id", "loan_id"])["osbal_after"].min().reset_index()
+        .query(f"osbal_after > {balance_threshold}")[["user_id", "loan_id"]]
+        .drop_duplicates()
+    )
+
+    # Perf window per user based on TPFP rows
+    perf_dates = (
+        base.merge(tpfp_nonrepaid, how="right", on=["user_id", "loan_id"])
+        .query('vendor_id == "TPFP"')
+        .groupby("user_id")[["repaid_date", "due_date"]]
+        .agg({"repaid_date": "min", "due_date": "max"})
+        .assign(
+            perf_start_date=lambda x: x[["repaid_date", "due_date"]].min(axis=1),
+            perf_end_date=lambda x: x[["repaid_date", "due_date"]].max(axis=1) + pd.DateOffset(months=2),
+        )
+        .drop(columns=["repaid_date", "due_date"])
+        .reset_index()
+    )
+
+    span = (
+        base.merge(perf_dates, how="right", on="user_id")
+        .query("repaid_date >= perf_start_date & repaid_date <= perf_end_date")
+        .assign(perf_window_flag=lambda x: (x["perf_end_date"] <= current_date).astype(int))
+    )
+
+    # Classify within the perf window
+    span['target'] = np.where(
+        (span['vendor_id'] != "TPFP") & (span['vendor_id'] != "TPSD"), 1, 0
+    )
+
+    # Maturity: negatives in open windows (perf_window_flag==0) are immature (0); otherwise 1
+    span['target_maturity_flag'] = np.where(
+        (span["perf_window_flag"] == 0) & (span["target"] == 0), 0, 1
+    )
+
+    # Aggregate to one row per user
+    tpfp_result_dt = span.groupby('user_id')[['target', 'last_tpsd_date', 'target_maturity_flag', 'perf_start_date', 'perf_end_date']].max().reset_index()
+
+    return tpfp_result_dt
+
+
+def _derive_leave_labels(
+    base: pd.DataFrame,
+    *,
+    current_date: pd.Timestamp
+) -> tuple[list, list, list]:
+    """
+    Leave branch (users with NO TPFP in obs window, but resignation in obs window).
+
+    Logic
+    -----
+    - Exclude users who have TPFP activity inside [last_tpsd_date, obs_end].
+    - Month-floor lower bound:
+        min_resignation_date_threshold = month_floor(last_tpsd_date - 1 month)
+    - Users are IN SCOPE for this branch if their resignation date lies within:
+        [min_resignation_date_threshold, obs_end].
+    - Performance window for each such user:
+        perf_start_date := GREATEST(last_tpsd_date, ee_resignation_date_correct)
+        perf_end_date   := perf_start_date + 2 months
+    - perf_window_flag := 1 if perf_end_date <= current_date, else 0.
+    - target := 1 if there exists ANY vendor not in {"TPFP","TPSD"} inside the perf window,
+                else 0.
+    - target_maturity_flag := 1 unless the perf window is open AND target==0.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per user with columns:
+        ['user_id', 'target', 'last_tpsd_date', 'target_maturity_flag',
+         'perf_start_date', 'perf_end_date']
+
+    BigQuery SQL mapping
+    --------------------
+    - month_floor:
+        DATE_TRUNC(DATE_SUB(last_tpsd_date, INTERVAL 1 MONTH), MONTH)
+    - perf window:
+        perf_start_date := GREATEST(last_tpsd_date, ee_resignation_date_correct)
+        perf_end_date   := DATE_ADD(perf_start_date, INTERVAL 2 MONTH)
+    - Window slice:
+        repaid_date BETWEEN perf_start_date AND perf_end_date
+    """
+    # Users with TPFP in obs window to exclude from leave branch
+    tpfp_in_obs_users = base.query('repaid_date <= obs_end & vendor_id == "TPFP"')["user_id"].unique().tolist()
+    mask_tpfp = base["user_id"].isin(tpfp_in_obs_users)
+
+    # Month-floor resignation threshold
+    min_resignation_threshold = _month_floor_threshold(base["last_tpsd_date"])
+
+    leave_in_obs = (
+        base[~mask_tpfp]
+        .assign(min_resignation_date_threshold=min_resignation_threshold)
+        .query(
+            "ee_resignation_date_correct <= obs_end & "
+            "ee_resignation_date_correct >= min_resignation_date_threshold"
+        )
+        .assign(
+            perf_start_date=lambda x: x[["last_tpsd_date", "ee_resignation_date_correct"]].max(axis=1),
+            perf_end_date=lambda x: x[["last_tpsd_date", "ee_resignation_date_correct"]].max(axis=1)
+            + pd.DateOffset(months=2),
+        )
+        .assign(perf_window_flag=lambda x: (x["perf_end_date"] <= current_date).astype(int))
+    )
+
+    leave_result_dt = (
+        leave_in_obs
+        .assign(
+            # Define target by checking for any non-TPFP/TPSD rows within the perf window
+            target=(
+                (leave_in_obs['repaid_date'] >= leave_in_obs['perf_start_date']) &
+                (leave_in_obs['repaid_date'] <= leave_in_obs['perf_end_date']) &
+                (leave_in_obs['vendor_id'] != "TPFP") &
+                (leave_in_obs['vendor_id'] != "TPSD")
+            ).astype('int')
+        )
+        .assign(
+            # Maturity: negatives in open windows are immature (0); otherwise 1
+            target_maturity_flag=lambda x: (~((x['target'] == 0) & (x['perf_window_flag'] == 0))).astype('int')
+        )
+        .groupby('user_id')[['target', 'last_tpsd_date', 'target_maturity_flag', 'perf_start_date', 'perf_end_date']]
+        .max()
+        .reset_index()
+    )
+
+    return leave_result_dt
+
+
+def compute_user_targets(
+    dt_repayments: pd.DataFrame,
+    dt: pd.DataFrame,
+    *,
+    obs_window: int = 5,
+    current_date: "str|pd.Timestamp" = "2025-02-15",
+    balance_threshold: float = 10.0
+) -> pd.DataFrame:
+    """
+    Build user-level targets using a TPSD anchor (per user) and two branches:
+    TPFP branch and LEAVE branch.
+
+    Inputs
+    ------
+    dt_repayments : pd.DataFrame
+        Required columns:
+          - user_id, loan_id, installment_number, vendor_id
+          - repaid_date, due_date
+          - osbal_after
+    dt : pd.DataFrame
+        Required columns:
+          - ee_customer_id, ee_resignation_date_correct
+    obs_window : int, default 5
+        Observation window length (in calendar months) after last_tpsd_date.
+    current_date : str | pd.Timestamp, default '2025-02-15'
+        Used to determine whether performance windows are already closed (mature).
+    balance_threshold : float, default 10.0
+        Minimum osbal_after to deem a TPFP loan “non-repaid”.
+
+    Output
+    ------
+    pd.DataFrame
+        Columns:
+          - user_id
+          - target                       (1/0)
+          - target_type                  ('tpfp' | 'leave')
+          - last_tpsd_date
+          - obs_end
+          - perf_start_date
+          - perf_end_date
+          - ee_resignation_date_correct
+          - target_maturity_flag         (branch-specific: see above)
+          - obs_incomplete_flag          (renamed from `future_flag`)
+          - target_maturity_flag_for_dev (= 1 if `target_maturity_flag == 1`
+                                          AND NOT (obs_incomplete_flag==1 & target_type=='leave'),
+                                          else 0)
+
+    Notes
+    -----
+    - This implementation **keeps** all rows (including immature windows) and exposes:
+        * `target_maturity_flag` (per-branch logic)
+        * `obs_incomplete_flag`  (formerly `future_flag`)
+        * `target_maturity_flag_for_dev` as a convenience feature for model dev.
+
+    BigQuery SQL mapping (high-level)
+    ---------------------------------
+    - TPSD anchor selection: use ROW_NUMBER() ordered by (repaid_date DESC, due_date DESC).
+    - TPFP non-repaid: MIN(osbal_after) OVER (PARTITION BY user_id, loan_id) > balance_threshold.
+    - Month-floor for leave lower bound:
+        DATE_TRUNC(DATE_SUB(last_tpsd_date, INTERVAL 1 MONTH), MONTH)
+    - Perf window:
+        perf_start_date := GREATEST(last_tpsd_date, ee_resignation_date_correct [for leave])
+        perf_end_date   := DATE_ADD(perf_start_date, INTERVAL 2 MONTH)
+    - Window slice:
+        repaid_date BETWEEN perf_start_date AND perf_end_date
+    """
+    # -----------------------------
+    # Safety & type normalization
+    # -----------------------------
+    rep = dt_repayments.copy()
+    dim = dt.copy()
+
+    # Normalize dtypes to avoid type errors in comparisons.
+    for c in ["repaid_date", "due_date"]:
+        rep[c] = pd.to_datetime(rep[c], errors="coerce")
+    dim["ee_resignation_date_correct"] = pd.to_datetime(dim["ee_resignation_date_correct"], errors="coerce")
+    rep["osbal_after"] = pd.to_numeric(rep["osbal_after"], errors="coerce")
+
+    # Accept string or Timestamp for current_date; ensure Timestamp.
+    current_date = pd.to_datetime(current_date)
+
+    # ------------------------------------------
+    # Attach resignation date to repayment rows
+    # ------------------------------------------
+    rep = rep.merge(
+        dim[["ee_customer_id", "ee_resignation_date_correct"]].drop_duplicates("ee_customer_id"),
+        how="left",
+        left_on="user_id",
+        right_on="ee_customer_id",
+    )
+
+    # ------------------------------------------
+    # Build TPSD anchor and base slice
+    # ------------------------------------------
+    tpsd_anchor = _build_tpsd_anchor(
+        rep, balance_threshold=balance_threshold, obs_window=obs_window, current_date=current_date
+    )
+
+    cols = [
+        "user_id",
+        "loan_id",
+        "installment_number",
+        "vendor_id",
+        "repaid_date",
+        "due_date",
+        "osbal_after",
+        "ee_resignation_date_correct",
+        "last_tpsd_date",
+        "obs_end",
+        "future_flag",
+    ]
+
+    target_base = (
+        rep.merge(tpsd_anchor, how="right", on="user_id")
+        .query("repaid_date >= last_tpsd_date")[cols]
+        .copy()
+    )
+
+    # ------------------------------------------
+    # Branch A: TPFP labels
+    # ------------------------------------------
+    tpfp_dt = _derive_tpfp_labels(target_base, balance_threshold=balance_threshold, current_date=current_date)
+
+    # ------------------------------------------
+    # Branch B: LEAVE labels (month_floor enforced)
+    # ------------------------------------------
+    leave_dt = _derive_leave_labels(target_base, current_date=current_date)
+
+    # ------------------------------------------
+    # Assemble labeled outputs
+    # ------------------------------------------
+    tpfp_dt['target_type'] = "tpfp" 
+    leave_dt['target_type'] = "leave"
+
+    target_dt = pd.concat(
+        [tpfp_dt, leave_dt],
+        ignore_index=True,
+    )
+
+    # Attach anchor metadata (one row per user)
+    meta = target_base[["user_id", "future_flag", "ee_resignation_date_correct", "obs_end"]].drop_duplicates("user_id")
+    target_dt = target_dt.merge(meta, how="left", on="user_id")
+
+    # Convenience maturity flag for model dev:
+    # keep target_maturity_flag==1, but nullify immature leave windows (obs still open)
+    target_dt['target_maturity_flag_for_dev'] = (
+        (target_dt['target_maturity_flag'] == 1) & ~((target_dt['future_flag'] == 1) & (target_dt['target_type'] == "leave"))
+    ).astype('int')
+
+    # Final tidy + rename future_flag to obs_incomplete_flag
+    return (
+        target_dt[["user_id", "target", "target_type", "last_tpsd_date", "obs_end", 
+                   "perf_start_date", "perf_end_date", "ee_resignation_date_correct",
+                   "target_maturity_flag", "future_flag", "target_maturity_flag_for_dev"]]
+        .rename(columns={'future_flag': "obs_incomplete_flag"})
+        .sort_values(["user_id", "target_type", "target"])
+        .reset_index(drop=True)
+    )
