@@ -386,7 +386,8 @@ LEFT JOIN tendopay_raw.employment_ids ON employment_ids.id = income_info.employm
 --LEFT JOIN tendopay_raw.tp_groups ON tp_groups.id = employer_group.group_id
 LEFT JOIN tendopay_raw.payment_responses pr on pr.tendopay_user_id=users.id
 LEFT JOIN tendopay_raw.model_has_permissions on model_has_permissions.model_id  = users.id
-LEFT JOIN (SELECT model_id,JSON_EXTRACT_SCALAR(PARSE_JSON(OPTIONS),'$.max_debt_income_ratio') max_debt_income_ratio FROM tendopay_raw.model_has_tp_events WHERE tp_event = "E0000011") model_has_tp_events  ON model_has_tp_events.model_id = employers.id
+LEFT JOIN (SELECT model_id,JSON_EXTRACT_SCALAR(PARSE_JSON(OPTIONS),'$.max_debt_income_ratio') max_debt_income_ratio 
+FROM tendopay_raw.model_has_tp_events WHERE tp_event = "E0000011") model_has_tp_events  ON model_has_tp_events.model_id = employers.id
 LEFT JOIN tendopay_raw.xendit_payment_responses ON xendit_payment_responses.reference_id  = pr.merchant_order_id
 LEFT JOIN (
 SELECT 

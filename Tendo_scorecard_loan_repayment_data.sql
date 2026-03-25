@@ -6,6 +6,7 @@ from tendopay_raw.split_purchases
 group by  repayment_schedule_id
 ), 
 payment_channel_data as (
+
 SELECT
 u.id as user_id,
 pr.id AS loan_id,

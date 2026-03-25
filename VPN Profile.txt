@@ -1,0 +1,22 @@
+VPN Profile
+https://vpn.tendopay.dev/k/CsgKj8Gh
+
+Initial Pin
+4139357
+
+
+
+VPN Profile
+https://vpn.tendopay.dev/k/CsgKj8Gh
+
+Initial Pin
+4139357
+1212121
+
+
+ip address: 172.20.22.198
+port : 3306
+uname : tp_ro_tonik
+ 
+0uonyLtDC3uv3FK
+ 
